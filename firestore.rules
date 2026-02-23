@@ -1,0 +1,114 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /**
+     * Core Philosophy: This ruleset enforces a strict security model based on user ownership and role-based access control (RBAC).
+     * User data is strictly private and accessible only by the owning user. Shared data, such as support messages, can be
+     * created by any authenticated user but can only be read by users explicitly granted a 'support admin' role.
+     *
+     * Data Structure: The data is organized into three distinct, top-level collections for clear separation of concerns:
+     * - /users/{userId}: Private user account information.
+     * - /support_messages/{messageId}: A central collection for all user-submitted support tickets.
+     * - /roles_support_admin/{userId}: A read-only collection that serves as a lookup table to identify users with administrative privileges.
+     *
+     * Key Security Decisions:
+     * - User data is segregated and non-listable to prevent data scraping. A user can only access their own document via its direct path.
+     * - The ability to read support messages is controlled by the existence of a document in the `/roles_support_admin` collection,
+     *   providing a simple and performant way to manage support staff access.
+     * - The roles collection itself is locked down from all client-side modifications, ensuring that roles can only be assigned
+     *   through a trusted server-side process or the Firebase Console.
+     * - Support messages are immutable from the client; once created, they cannot be updated or deleted by users.
+     *
+     * Denormalization for Authorization:
+     * - To secure the creation of support messages without complex lookups, each `/support_messages` document must contain a
+     *   denormalized `senderId` field, which is validated against the authenticated user's UID.
+     *
+     * Structural Segregation:
+     * - Private user data (`/users`) and shared support data (`/support_messages`) are in separate top-level collections. This
+     *   prevents any potential for access rule overlap and simplifies query security.
+     */
+
+    // ----------------------------------------------------------------
+    // Helper Functions
+    // ----------------------------------------------------------------
+
+    /**
+     * Checks if a user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Checks if the currently authenticated user's UID matches the provided userId.
+     * This is the primary function for enforcing data ownership.
+     */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    /**
+     * Checks if the authenticated user has a support admin role.
+     * This is determined by the existence of a corresponding document in the roles collection.
+     */
+    function isSupportAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/roles_support_admin/$(request.auth.uid));
+    }
+
+    // ----------------------------------------------------------------
+    // Collection Rules
+    // ----------------------------------------------------------------
+
+    /**
+     * @description Controls access to private user account documents.
+     * @path /users/{userId}
+     */
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false; // Disallow listing of users for privacy and security.
+
+      allow create: if isOwner(userId)
+                    && request.resource.data.id == userId
+                    && request.resource.data.email == request.auth.token.email
+                    && request.resource.data.registrationTimestamp is string
+                    && request.resource.data.isEmailConfirmed == false
+                    && request.resource.data.isRegistrationComplete == false
+                    && request.resource.data.photoURL is string
+                    && request.resource.data.lastSeen is string
+                    && request.resource.data.name is string
+                    && request.resource.data.keys().hasOnly([
+                        'id', 'email', 'registrationTimestamp', 'isEmailConfirmed',
+                        'isRegistrationComplete', 'photoURL', 'lastSeen', 'name'
+                    ]);
+
+      allow update: if isOwner(userId);
+
+      allow delete: if isOwner(userId);
+    }
+
+    /**
+     * @description Manages user-submitted support messages. Allows any signed-in user to create a message, but only allows
+     *              authorized support admins to read or list them.
+     * @path /support_messages/{messageId}
+     */
+    match /support_messages/{messageId} {
+      allow get: if isSupportAdmin();
+      allow list: if isSupportAdmin();
+      allow create: if isSignedIn() && request.resource.data.senderId == request.auth.uid;
+      allow update: if false; // Messages are immutable from the client.
+      allow delete: if false; // Messages cannot be deleted from the client.
+    }
+
+    /**
+     * @description A marker collection to grant support admin privileges. This collection should be managed by a trusted backend,
+     *              not by clients. All client-side access is denied.
+     * @path /roles_support_admin/{userId}
+     */
+    match /roles_support_admin/{userId} {
+      allow get, list, create, update, delete: if false;
+    }
+
+  }
+}
